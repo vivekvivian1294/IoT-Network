@@ -1,0 +1,4 @@
+set GOOGLE_APPLICATION_CREDENTIALS="C:\christos901129test-9b55eb70bfd2.json"
+
+Powershell
+$env:GOOGLE_APPLICATION_CREDENTIALS="C:\Users\christos.magiras\OneDrive - Irisgruppen\Documents\Uppsala University\Nuxt-js-project.0.3\stockholm-group\christos901129test-a0e02a3fcef2.json"
