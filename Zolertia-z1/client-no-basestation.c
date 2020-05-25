@@ -29,11 +29,11 @@
 //#define TMP102_READ_INTERVAL (CLOCK_SECOND * 300)
 
 #define TMP102_READ_INTERVAL_MIN (CLOCK_SECOND * 60)
-#define TMP102_READ_INTERVAL (TMP102_READ_INTERVAL_MIN * 5)
-//#define TMP102_READ_INTERVAL (CLOCK_SECOND * 5)
+//#define TMP102_READ_INTERVAL (TMP102_READ_INTERVAL_MIN * 5)
+#define TMP102_READ_INTERVAL (CLOCK_SECOND * 5)
 
 /* Declaration and assignment of maximum neighbours and total amount of timeout */
-#define NEIGHBOR_TIMEOUT 120 * CLOCK_SECOND
+#define NEIGHBOR_TIMEOUT 20 * CLOCK_SECOND
 #define MAX_NEIGHBORS 16
 
 /* Holds the number of packets received. */
@@ -64,27 +64,6 @@ PROCESS(anouncement_process, "Anouncenement process");
 /* The client process should be started automatically when
  * the node has booted. */
 AUTOSTART_PROCESSES(&client_process);
-
-/* Compare rime addresses (only the first field) WARNING: THIS DOES NOT WORK */
-int rimeaddr_cmp_u80(const rimeaddr_t *addr1, const rimeaddr_t *addr2)
-{
-	if(addr1->u8[0] != addr2->u8[0]) {
-		return 1;
-	}
-	return 0;
-}
-
-/* Compare rime addresses (only the second field) WARNING: THIS DOES NOT WORK */
-int rimeaddr_cmp_u81(const rimeaddr_t *addr1, const rimeaddr_t *addr2)
-{
-	if(addr1->u8[1] > addr2->u8[1]) {
-		return 1;
-	}
-	else if (addr1->u8[1] < addr2->u8[1]) {
-		return -1;
-	}
-	return 0;
-}
 
 LIST(neighbor_table);
 MEMB(neighbor_mem, struct example_neighbor, MAX_NEIGHBORS);
@@ -197,6 +176,8 @@ forward(struct multihop_conn *c, const rimeaddr_t *originator,
 				//Break the loop and get the desired n value
 				//printf("Found the 128.0 address! Setting num to %d! \n", pointer);
 				printf("Found destination! Forwarding message to destination\n");
+				leds_on(LEDS_GREEN);
+				leds_off(LEDS_BLUE);
 				num = pointer;
 				//Set flag to 1, so no random variables is used
 				flag = 1;
@@ -214,6 +195,8 @@ forward(struct multihop_conn *c, const rimeaddr_t *originator,
 				if( n->layer < layer && !rimeaddr_cmp(&destination, &n->addr) )
 				{
 					printf("Did not found destination! Forwarding message to: %d.%d\n", n->addr.u8[0], n->addr.u8[1]);
+					leds_off(LEDS_GREEN);
+					leds_on(LEDS_BLUE);
 					//Break the loop and get the desired n value
 					num = pointer;
 					//Set flag to 1, so no random variables is used
@@ -270,10 +253,8 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
   	static signed char rss_val;
   	static signed char rss_offset;
 	
-	
-
 	printf("broadcast message received from %d.%d: %s\n", from->u8[0], from->u8[1], (char *)packetbuf_dataptr());
-	
+
 	//Get the RSSI (signal strength)
 	rss_val = cc2420_last_rssi;  // Get the RSSI from the last received packet
 	rss_offset = -45; // Datasheet of cc2420 page 49 says you must decrease the value in -45
@@ -283,17 +264,18 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 
 	printf("RSSI: %d\n", rss);
 	
-	//If rss is less than -79 (neighbor is too far away)
-	if(rss <= -79)
+	//If rss is less than -70 (neighbor is too far away)
+	if(rss <= -70)
 	{
 		//Stop the function
 		return;
 	}
-
+	
 	//if broadcast is being received from basestation
 	if(rimeaddr_cmp(from, &destination))
 	{
-		layer = 1;
+		return;		
+		layer = 1;		
 	}
 	//else, if your layer is greater than the received layer 
 	else if(layer > atoi((char *)packetbuf_dataptr()))
@@ -332,7 +314,6 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 			printf("NEIGHBOUR WAS FOUND! UPDATE TIMER\n");
 		/* Our neighbor was found, so we update the timeout. */
 			printf("UPDATE LAYER\n");
-			
 			e->layer = atoi((char *)packetbuf_dataptr());
 			ctimer_set(&e->ctimer, NEIGHBOR_TIMEOUT, remove_neighbor, e);
 			printf("STOP FUNCTION\n");
@@ -512,7 +493,7 @@ PROCESS_THREAD(anouncement_process, ev, data) {
 	{
 		
 		//printf("Listening announcement!\n");
-		etimer_set(&at, CLOCK_SECOND*60);
+		etimer_set(&at, CLOCK_SECOND*10);
 		PROCESS_WAIT_UNTIL(etimer_expired(&at));
 		snprintf(str_send, 3, "%d\n", layer);
 		printf("Broadcasting: %s \n", str_send);
