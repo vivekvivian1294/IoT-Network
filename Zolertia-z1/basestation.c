@@ -33,7 +33,7 @@
 #define TMP102_READ_INTERVAL (CLOCK_SECOND * 2)
 
 /* Declaration and assignment of maximum neighbours and total amount of timeout */
-#define NEIGHBOR_TIMEOUT 300 * CLOCK_SECOND
+#define NEIGHBOR_TIMEOUT 3000 * CLOCK_SECOND
 #define MAX_NEIGHBORS 16
 
 /* Holds the number of packets received. */
@@ -64,8 +64,9 @@ static struct etimer etimer;
 /* Struct of next neighbor */
 struct example_neighbor {
   	struct example_neighbor *next;
-  	rimeaddr_t addr;
   	struct ctimer ctimer;
+	rimeaddr_t forward_addr;
+	rimeaddr_t dest_addr;
 };
 
 /* Declare our "main" process, the client process*/
@@ -76,21 +77,20 @@ PROCESS(anouncement_process, "Anouncenement process");
  * the node has booted. */
 AUTOSTART_PROCESSES(&client_process);
 
+/* Multihop functions */
+
+/* List for the neighbor table */
+LIST(neighbor_table);
+
+MEMB(neighbor_mem, struct example_neighbor, MAX_NEIGHBORS);
+
 /* Broadcast functions */
 static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 {
-  //printf("broadcast message received from %d.%d\n", from->u8[0], from->u8[1]);
 }
 
 static const struct broadcast_callbacks broadcast_call = {broadcast_recv};
 static struct broadcast_conn broadcast;
-
-
-
-/* Multihop functions */
-
-LIST(neighbor_table);
-MEMB(neighbor_mem, struct example_neighbor, MAX_NEIGHBORS);
 
 /*
  * This function is called by the ctimer present in each neighbor
@@ -100,9 +100,9 @@ MEMB(neighbor_mem, struct example_neighbor, MAX_NEIGHBORS);
 static void remove_neighbor(void *n)
 {
   	struct example_neighbor *e = n;
-
   	list_remove(neighbor_table, e);
-  	memb_free(&neighbor_mem, e);
+	memb_free(&neighbor_mem, e);
+
 }
 
 /*
@@ -115,32 +115,12 @@ static void remove_neighbor(void *n)
 static void received_announcement(struct announcement *a, 
 	const rimeaddr_t *from,	uint16_t id, uint16_t value)
 {
-	struct example_neighbor *e;
-
-	/*  printf("Got announcement from %d.%d, id %d, value %d\n",
-		from->u8[0], from->u8[1], id, value);*/
-
-	/* We received an announcement from a neighbor so we need to update
-		the neighbor list, or add a new entry to the table. */
-	for(e = list_head(neighbor_table); e != NULL; e = e->next) {
-		if(rimeaddr_cmp(from, &e->addr)) {
-		/* Our neighbor was found, so we update the timeout. */
-			ctimer_set(&e->ctimer, NEIGHBOR_TIMEOUT, remove_neighbor, e);
-      		return;
-    		}
-  	}
-
-	/* The neighbor was not found in the list, so we add a new entry by
-		allocating memory from the neighbor_mem pool, fill in the
-		necessary fields, and add it to the list. */
-	e = memb_alloc(&neighbor_mem);
-	if(e != NULL) {
-		rimeaddr_copy(&e->addr, from);
-		list_add(neighbor_table, e);
-		ctimer_set(&e->ctimer, NEIGHBOR_TIMEOUT, remove_neighbor, e);
-	}
+	
 }
 static struct announcement example_announcement;
+
+/* Declare multihop variable */
+static struct multihop_conn multihop;
 
 /*
  * This function is called at the final recepient of the message.
@@ -148,7 +128,44 @@ static struct announcement example_announcement;
 static void recv(struct multihop_conn *c, const rimeaddr_t *from, 
 	const rimeaddr_t *prevhop, uint8_t hops)
 {
+	struct example_neighbor *n;
+	int loop_flag = 0;
+	//if from is not the same as previous hop
+	/* Update your forward list, if you want to send a message back to the originator you forward it to prevhop */
+	//if there are already items in the table
+	if(list_length(neighbor_table) > 0) {
+		//Loop through the forward table
+		//printf("LOOP THROUGH LIST\n");
+		for(n = list_head(neighbor_table); n != NULL && loop_flag == 0; n = n->next) {
+			//if fn->dest_addr is the same as from address (address is already in our list 
+			if( rimeaddr_cmp(&n->dest_addr, from) ) {
+				//Break for loop
+				//printf("FOUND ADDRESS!\n");
+				//Update forward address
+				rimeaddr_copy(&n->forward_addr, prevhop);
+				loop_flag = 1;
+				ctimer_set(&n->ctimer, NEIGHBOR_TIMEOUT, remove_neighbor, n);
+			}
+		}
+	}
+	
+	//if loop_flag is still 0 (address was not found)
+	if(loop_flag == 0) {
+		//Loop again through the list 
+		//printf("ADDRESS WAS NOT FOUND! LOOP AGAIN THROUGH LIST!\n");
+		for(n = list_head(neighbor_table); n != NULL && loop_flag == 0; n = n->next);
+		//Allocate new memory
+		n = memb_alloc(&neighbor_mem);
+		if(n != NULL) {
+			//Add new address to forward list
+			rimeaddr_copy(&n->dest_addr, from);
+			rimeaddr_copy(&n->forward_addr, prevhop);
+			list_add(neighbor_table, n);
+		}
+			
+	}
 	/* Update rebooting timer to 3600 seconds */
+	//printf("SET NEW TIMER\n");
 	etimer_set(&etimer, CLOCK_SECOND*3600);
 	//Initialize counter
 	count++;
@@ -242,13 +259,18 @@ static void recv(struct multihop_conn *c, const rimeaddr_t *from,
 
 	//Printf for serial
 	printf("Temp=%c%d.%04d,Battery=%ld.%03d,Mote=%d.%d\n", minus, tempint, tempfrac, (long) mv, (unsigned) ((mv - floor(mv)) * 1000), from->u8[0], from->u8[1]);
+	
+	//Send back the message for resetting the watchdog of client
+	packetbuf_copyfrom("RESET", 6);
+	multihop_send(&multihop, from);
 	//printf("Basestation: Message received! Count: %d\n", count);
 	//printf("Multihop message received from %d.%d: Temp = %c%d.%04d \n",
         //from->u8[0], from->u8[1], minus, tempint, tempfrac);
-	//printf("Previous hop: %d.%d\n", prevhop->u8[0], prevhop->u8[1]);
+	printf("Previous hop: %d.%d\n", prevhop->u8[0], prevhop->u8[1]);
 	leds_off(LEDS_ALL);
 	leds_on(count & 0b111);
 	free(str_raw);
+	//printf("STR_RAW IS FREE!\n");
 }
 
 /*
@@ -258,40 +280,48 @@ static void recv(struct multihop_conn *c, const rimeaddr_t *from,
  * found, the function returns NULL to signal to the multihop layer
  * that the packet should be dropped.
  */
+
+
+
 static rimeaddr_t *
 forward(struct multihop_conn *c, const rimeaddr_t *originator, 
 	const rimeaddr_t *dest, const rimeaddr_t *prevhop, 
 	uint8_t hops)
 {
-	/* Find a random neighbor to send to. */
-	int num, i;
+	
+	//printf("IM INSIDE FORWARDING!\n");
 	struct example_neighbor *n;
+	//Set the desired destination
+	rimeaddr_t destination;
+	destination.u8[0] = 128;
+	destination.u8[1] = 0;
+	//If destination is not the basestation
+	if( !rimeaddr_cmp(dest, &destination) ) {
+		//printf("Destination is not the basestation!\n");
+		if(list_length(neighbor_table) > 0) {
+			//Loop through the forward list
+			//printf("LOOPING THROUGH THE FORWARD LIST");
+			for(n = list_head(neighbor_table); n != NULL; n = n->next) {
+				//if destination address is the same as n->dest_addr 
+				if( rimeaddr_cmp(&n->dest_addr, dest) ) {
+					//Forward message to forward_addr
+					printf("FORWARD MESSAGE TO %d.%d\n", n->forward_addr.u8[0], n->forward_addr.u8[1]);
+					return &n->forward_addr;
+				}
+			}
+		}
+		
+	}
 
-	if(list_length(neighbor_table) > 0) {
-		num = random_rand() % list_length(neighbor_table);
-		i = 0;
-		for(n = list_head(neighbor_table); n != NULL && i != num; n = n->next) {
-			++i;
-		}
-		if(n != NULL) {
-			/*
-			printf("%d.%d: Forwarding packet to %d.%d (%d in list), hops %d\n",
-			rimeaddr_node_addr.u8[0], rimeaddr_node_addr.u8[1],
-			n->addr.u8[0], n->addr.u8[1], num,
-			packetbuf_attr(PACKETBUF_ATTR_HOPS));
-			*/
-			return &n->addr;
-		}
-  	}
 	/*
 	printf("%d.%d: did not find a neighbor to forward to\n", rimeaddr_node_addr.u8[0], 
 	rimeaddr_node_addr.u8[1]);
 	*/
 	return NULL;
 }
-static const struct multihop_callbacks multihop_call = {recv, forward};
-static struct multihop_conn multihop;
 
+/* Declare multihop callbacks */
+static const struct multihop_callbacks multihop_call = {recv, forward};
 /* Our main process. */
 PROCESS_THREAD(client_process, ev, data) {
 	//PROCESS_EXITHANDLER(multihop_close(&multihop);)
@@ -336,6 +366,7 @@ PROCESS_THREAD(client_process, ev, data) {
 	
 	PROCESS_WAIT_UNTIL(etimer_expired(&etimer));
 	/* Reboot mote */
+	//printf("REBOOTING MOTE!\n");
 	watchdog_reboot();
 	
 
@@ -360,7 +391,6 @@ PROCESS_THREAD(anouncement_process, ev, data) {
 		
 		packetbuf_copyfrom("Hello", 6);
     		broadcast_send(&broadcast);
-		announcement_listen(10);
 		if(counter > 1000){counter = 0;}
 		//announcement_set_value(&example_announcement, counter);
 		counter++;

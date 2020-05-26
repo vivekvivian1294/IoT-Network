@@ -1,6 +1,7 @@
 /* Libraries for printf, malloc atoi purposes */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Libraries for contiki and rime protocol */
 #include "contiki.h"
@@ -9,6 +10,9 @@
 #include "lib/list.h"
 #include "lib/memb.h"
 #include "lib/random.h"
+
+/* Library for restarting the mote */
+#include "dev/watchdog.h"
 
 /* Libraries for Z1 mote */
 #include "dev/button-sensor.h"
@@ -33,7 +37,8 @@
 #define TMP102_READ_INTERVAL (CLOCK_SECOND * 5)
 
 /* Declaration and assignment of maximum neighbours and total amount of timeout */
-#define NEIGHBOR_TIMEOUT 20 * CLOCK_SECOND
+#define NEIGHBOR_TIMEOUT 120 * CLOCK_SECOND
+#define NEIGHBOR_FORWARD_TIMEOUT 3000 * CLOCK_SECOND
 #define MAX_NEIGHBORS 16
 
 /* Holds the number of packets received. */
@@ -46,6 +51,8 @@ static int count = 0;
 static struct etimer et;
 /* Declare timer for announcements */
 static struct etimer at;
+/* Declare timer for watchdog */
+static struct etimer wt;
 
 /* Struct of next neighbor */
 struct example_neighbor {
@@ -55,18 +62,50 @@ struct example_neighbor {
   	struct ctimer ctimer;
 };
 
+struct forward_neighbor {
+  	struct forward_neighbor *next;
+  	rimeaddr_t dest_addr;
+	rimeaddr_t forward_addr;
+  	struct ctimer ctimer;
+};
+
 /* Declare our "main" process, the client process*/
 PROCESS(client_process, "Stockholm group");
 /* Declare our listening announcement process */
 PROCESS(anouncement_process, "Anouncenement process");
 /* Declare our watchdog process */
-//PROCESS(watchdog_process, "Watchdog process");
+PROCESS(watchdog_process, "Watchdog process");
 /* The client process should be started automatically when
  * the node has booted. */
 AUTOSTART_PROCESSES(&client_process);
 
+/* Compare rime addresses (only the first field) WARNING: THIS DOES NOT WORK */
+int rimeaddr_cmp_u80(const rimeaddr_t *addr1, const rimeaddr_t *addr2)
+{
+	if(addr1->u8[0] != addr2->u8[0]) {
+		return 1;
+	}
+	return 0;
+}
+
+/* Compare rime addresses (only the second field) WARNING: THIS DOES NOT WORK */
+int rimeaddr_cmp_u81(const rimeaddr_t *addr1, const rimeaddr_t *addr2)
+{
+	if(addr1->u8[1] > addr2->u8[1]) {
+		return 1;
+	}
+	else if (addr1->u8[1] < addr2->u8[1]) {
+		return -1;
+	}
+	return 0;
+}
+
+/* Declare neighbor table list */
 LIST(neighbor_table);
 MEMB(neighbor_mem, struct example_neighbor, MAX_NEIGHBORS);
+/* Declare forward table list */
+LIST(forward_table);
+MEMB(forward_mem, struct forward_neighbor, MAX_NEIGHBORS);
 
 uint8_t layer = 50;
 
@@ -83,7 +122,14 @@ static void remove_neighbor(void *n)
 
   	list_remove(neighbor_table, e);
   	memb_free(&neighbor_mem, e);
+}
 
+static void remove_forward_neighbor(void *n)
+{
+  	struct forward_neighbor *e = n;
+
+  	list_remove(forward_table, e);
+  	memb_free(&forward_mem, e);
 }
 
 /*
@@ -106,42 +152,11 @@ static struct announcement example_announcement;
 static void recv(struct multihop_conn *c, const rimeaddr_t *from, 
 	const rimeaddr_t *prevhop, uint8_t hops)
 {
-	count++;
-	
-	/* Declaration of temperature variables */
-	int16_t tempint;
-	uint16_t tempfrac;
-	int16_t raw[1];
-	char *str_raw;
-	uint16_t absraw;
-	int16_t sign;
-	char minus = ' ';
-
-	/* 0bxxxxx allows us to write binary values */
-	/* for example, 0b10 is 2 */
-	
-
-	/* The packetbuf_dataptr() returns a pointer to the first data byte
-     	in the received packet. */
-	/* Get the raw data */
-	str_raw = packetbuf_dataptr();
-	raw[0] = atoi(str_raw);
-	sign = 1;
-	absraw = raw[0];
-    	if(raw[0] < 0) {	// Perform 2C's if sensor returned negative data
-      		absraw = (*raw ^ 0xFFFF) + 1;
-      		sign = -1;
-    	}
-    	tempint = (absraw >> 8) * sign;
-    	tempfrac = ((absraw >> 4) % 16) * 625;	// Info in 1/10000 of degree
-    	minus = ((tempint == 0) & (sign == -1)) ? '-' : ' ';
-	
-	printf("Basestation: Message received! Count: %d\n", count);
-	printf("Multihop message received from %d.%d: Temp = %c%d.%04d \n",
-        from->u8[0], from->u8[1], minus, tempint, tempfrac);
-	printf("Previous hop: %d.%d\n", prevhop->u8[0], prevhop->u8[1]);
-	leds_off(LEDS_ALL);
-	leds_on(count & 0b111);
+	//If received message is RESET
+	if( strcmp((char *) packetbuf_dataptr(), "RESET\n") ) {
+		printf("\nI RECEIVED MESSAGE FROM BASESTATION! IF STATEMENT\n\n");
+		etimer_set(&wt, CLOCK_SECOND*3600);
+	}
 }
 
 /*
@@ -158,80 +173,97 @@ forward(struct multihop_conn *c, const rimeaddr_t *originator,
 {
 	printf("IM INSIDE FORWARDING!\n");
 	/* Find a random neighbor to send to. */
-	int num = 0, i;
 	int flag = 0;
-	int pointer = 0;
 	struct example_neighbor *n;
 	//Set the desired destination
 	rimeaddr_t destination;
 	destination.u8[0] = 128;
 	destination.u8[1] = 0;
-
-	if(list_length(neighbor_table) > 0) {
-		//Loop through the list for getting layer 0
-		for(n = list_head(neighbor_table); n != NULL; n = n->next) {
-			printf("LOOP THROUGH NEIGHBOURS! %d.%d\n", n->addr.u8[0], n->addr.u8[1]);
-			//If rime address is the destination
-			if(rimeaddr_cmp(&destination, &n->addr)) {
-				//Break the loop and get the desired n value
-				//printf("Found the 128.0 address! Setting num to %d! \n", pointer);
-				printf("Found destination! Forwarding message to destination\n");
-				leds_on(LEDS_GREEN);
-				leds_off(LEDS_BLUE);
-				num = pointer;
-				//Set flag to 1, so no random variables is used
-				flag = 1;
+	/* Declare forward_neighbor struct for updating forward_table list */
+	struct forward_neighbor *e;
+	int flag_forward = 0;
+	//if destination is the same as dest
+	if( rimeaddr_cmp(&destination, dest) )
+	{
+		//Control if originator is not the same as current mote (for updating the forward_table list)
+		if( !rimeaddr_cmp(&rimeaddr_node_addr, originator) ) {
+			//Update forward_table list
+			//Loop through the forward table list
+			if (list_length(forward_table) > 0) {
+				for(e = list_head(forward_table); e != NULL && flag_forward != 0; e = e->next) {
+					//if address is the same as originator (the originator exists already in the list)
+					if( rimeaddr_cmp(&e->dest_addr, originator) ) {
+						printf("FORWARD NEIGHBOUR WAS FOUND! UPDATE TIMER\n");
+						//Update neighbor forward timer
+						rimeaddr_copy(&e->forward_addr, prevhop);
+						ctimer_set(&e->ctimer, NEIGHBOR_FORWARD_TIMEOUT, remove_forward_neighbor, e);
+						//Set flag forward to 1
+						flag_forward = 1;
+					}
+				}
 			}
-		pointer++;
+			//if flag_forward is still 0 (did not found the forward neighbor)
+			if( flag_forward == 0) {
+				/* The neighbor was not found in the list, so we add a new entry by
+				allocating memory from the neighbor_mem pool, fill in the
+				necessary fields, and add it to the list. */
+				e = memb_alloc(&forward_mem);
+				if(e != NULL) {
+					printf("FORWARD NEIGHBOR WAS NOT FOUND! SET NEW FORWARD NEIGHBOUR TO LIST\n");
+					rimeaddr_copy(&e->dest_addr, originator);
+					rimeaddr_copy(&e->forward_addr, prevhop);
+					list_add(neighbor_table, e);
+					ctimer_set(&e->ctimer, NEIGHBOR_FORWARD_TIMEOUT, remove_forward_neighbor, e);
+				}
+				
+			}
 		}
-		//Set pointer to 0 to run a new loop
-		pointer = 0;
-		//if flag is still 0, loop through the other motes
-		if(flag == 0)
-		{
+		//Forward the message to destination
+		if(list_length(neighbor_table) > 0) {
+			//Loop through the list for getting layer 0
+			for(n = list_head(neighbor_table); n != NULL; n = n->next) {
+				printf("LOOP THROUGH NEIGHBOURS! %d.%d\n", n->addr.u8[0], n->addr.u8[1]);
+				//If rime address is the destination
+				if(rimeaddr_cmp(&destination, &n->addr)) {
+					//Break the loop and get the desired n value
+					//printf("Found the 128.0 address! Setting num to %d! \n", pointer);
+					printf("Found destination! Forwarding message to destination\n");
+					return &n->addr;
+				}
+			}
+			//if flag is still 0, loop through the other motes
 			for(n = list_head(neighbor_table); n != NULL && flag == 0; n = n->next)
 			{
 				//if neighbour address is closer to the basestation
 				if( n->layer < layer && !rimeaddr_cmp(&destination, &n->addr) )
 				{
 					printf("Did not found destination! Forwarding message to: %d.%d\n", n->addr.u8[0], n->addr.u8[1]);
-					leds_off(LEDS_GREEN);
-					leds_on(LEDS_BLUE);
 					//Break the loop and get the desired n value
-					num = pointer;
-					//Set flag to 1, so no random variables is used
-					flag = 1;
+					return &n->addr;
 				}
-				pointer++;
 			}
-			
+  		}
+		
+	}
+	//else if destination is not the basestation
+	else {
+		if(list_length(forward_table) > 0) {
+			//Loop through the list
+			for(e = list_head(forward_table); e != NULL && flag_forward != 0; e = e->next) {
+				//if destination is inside the list
+				if ( rimeaddr_cmp(&e->dest_addr, dest) ) {
+					printf("Found forward destination! Forwarding message to prevhop!\n");
+					//forward the message to forward address
+					return &e->forward_addr;
+				}
+			}
 		}
-		//If flag is still 0, set it to a random neighbour
-		//if(flag == 0)
-		//{
-		//	num = random_rand() % list_length(neighbor_table);			
-		//	printf("Did not found the address! Setting random num variable!\n");
-		//}
-		//Set flag and i to 0		
-		flag = 0;
-		i = 0;
-		for(n = list_head(neighbor_table); n != NULL && i != num; n = n->next) {
-			++i;
-		}
-		if(n != NULL) {
-			
-			printf("%d.%d: Forwarding packet to %d.%d (%d in list), hops %d\n",
-			originator->u8[0], originator->u8[1],
-			n->addr.u8[0], n->addr.u8[1], num,
-			packetbuf_attr(PACKETBUF_ATTR_HOPS));
-			
-			return &n->addr;
-		}
-  	}
-	/*
+	}
+	
+	
 	printf("%d.%d: did not find a neighbor to forward to\n", rimeaddr_node_addr.u8[0], 
 	rimeaddr_node_addr.u8[1]);
-	*/
+	
 	return NULL;
 }
 static const struct multihop_callbacks multihop_call = {recv, forward};
@@ -253,8 +285,11 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
   	static signed char rss_val;
   	static signed char rss_offset;
 	
+	
+	//if message received from basestation stop the function
+	if( rimeaddr_cmp(&destination, from) ) {return;}
 	printf("broadcast message received from %d.%d: %s\n", from->u8[0], from->u8[1], (char *)packetbuf_dataptr());
-
+	
 	//Get the RSSI (signal strength)
 	rss_val = cc2420_last_rssi;  // Get the RSSI from the last received packet
 	rss_offset = -45; // Datasheet of cc2420 page 49 says you must decrease the value in -45
@@ -264,18 +299,17 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 
 	printf("RSSI: %d\n", rss);
 	
-	//If rss is less than -70 (neighbor is too far away)
-	if(rss <= -70)
+	//If rss is less than -79 (neighbor is too far away)
+	if(rss <= -79)
 	{
 		//Stop the function
 		return;
 	}
-	
+
 	//if broadcast is being received from basestation
 	if(rimeaddr_cmp(from, &destination))
 	{
-		return;		
-		layer = 1;		
+		layer = 1;
 	}
 	//else, if your layer is greater than the received layer 
 	else if(layer > atoi((char *)packetbuf_dataptr()))
@@ -300,11 +334,7 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 			printf("FOUND NEIGHBOUR BASESTATION!\n");
 			leds_on(LEDS_GREEN);
 			leds_off(LEDS_BLUE);
-			//set temp_variable.u8[1] to 1 (layer 1)
-			//temp_variable.u8[1] = 1; //142.1
-			//Update mote's current address 
-			//rimeaddr_set_node_addr(&temp_variable);
-			printf("My new address is: %d.%d!\n", rimeaddr_node_addr.u8[0], rimeaddr_node_addr.u8[1]);	
+			//printf("My new address is: %d.%d!\n", rimeaddr_node_addr.u8[0], rimeaddr_node_addr.u8[1]);	
 			flag = 1;
 			//update current variable
 		}
@@ -314,6 +344,7 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 			printf("NEIGHBOUR WAS FOUND! UPDATE TIMER\n");
 		/* Our neighbor was found, so we update the timeout. */
 			printf("UPDATE LAYER\n");
+			//Update the layer
 			e->layer = atoi((char *)packetbuf_dataptr());
 			ctimer_set(&e->ctimer, NEIGHBOR_TIMEOUT, remove_neighbor, e);
 			printf("STOP FUNCTION\n");
@@ -322,7 +353,7 @@ static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
   	}
 	for(e = list_head(neighbor_table); e != NULL && flag == 0; e = e->next) {
 		//if flag is still 0 (the mote cannot find the basestation) and the 2nd address (.0, .1 etc) is less than the current address OR current address's 2nd address (.0, .1 etc) is 0 (INITIAL VALUE)
-		if(flag == 0 &&  !rimeaddr_cmp(from, &destination) ){
+		if( !rimeaddr_cmp(from, &destination) ){
 			printf("FOUND ANOTHER NEIGHBOUR!\n");
 			//temp_variable.u8[1] = e->addr.u8[1] + 1;
 			//Update mote's current address 
@@ -414,7 +445,7 @@ PROCESS_THREAD(client_process, ev, data) {
 	process_start(&anouncement_process, "");
 	
 	/* Start watchdog process */
-	//process_start(&watchdog_process, "");
+	process_start(&watchdog_process, "");
 
 	rimeaddr_t to;
 		
@@ -493,7 +524,7 @@ PROCESS_THREAD(anouncement_process, ev, data) {
 	{
 		
 		//printf("Listening announcement!\n");
-		etimer_set(&at, CLOCK_SECOND*10);
+		etimer_set(&at, CLOCK_SECOND*60);
 		PROCESS_WAIT_UNTIL(etimer_expired(&at));
 		snprintf(str_send, 3, "%d\n", layer);
 		printf("Broadcasting: %s \n", str_send);
@@ -505,20 +536,18 @@ PROCESS_THREAD(anouncement_process, ev, data) {
 }
 
 /* Our watchdog process */
-//PROCESS_THREAD(anouncement_process, ev, data) {
+PROCESS_THREAD(watchdog_process, ev, data) {
 //	PROCESS_EXITHANDLER(multihop_close(&multihop);)
-//	
-//	PROCESS_BEGIN();
-//	struct static etimer wt;
-//	/* Set Watchdog timer to 1 hour */
-//	while(1)
-//	{
-//		printf("Watchdog started!\n");
-//		etimer_set(&at, CLOCK_SECOND*3600);
-//		PROCESS_WAIT_UNTIL(etimer_expired(&at));
-//		/* Reboot mote */
-//		watchdog_reboot();
-//		
-//	}
-//	PROCESS_END();
-//}
+	
+	PROCESS_BEGIN();
+	while(1)
+	{
+		printf("Watchdog started!\n");
+		etimer_set(&et, CLOCK_SECOND*3600);
+		PROCESS_WAIT_UNTIL(etimer_expired(&et));
+		/* Reboot mote */
+		watchdog_reboot();
+		
+	}
+	PROCESS_END();
+}
